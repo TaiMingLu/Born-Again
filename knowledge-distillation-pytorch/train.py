@@ -65,6 +65,153 @@ parser.add_argument('--wandb_tags', nargs='*', default=None,
                     help="Optional list of tags to attach to the W&B run.")
 parser.add_argument('--teacher_checkpoint', default=None,
                     help="Optional path to override the teacher checkpoint supplied in the JSON config.")
+parser.add_argument('--dataset', type=str, default=None,
+                    help="Dataset name when not supplying a params.json file.")
+parser.add_argument('--arch', type=str, default=None,
+                    help="Architecture identifier recorded in logs and W&B.")
+parser.add_argument('--model_version', type=str, default=None,
+                    help="Model variant to instantiate.")
+parser.add_argument('--teacher', type=str, default=None,
+                    help="Teacher model identifier (use 'none' for vanilla training).")
+parser.add_argument('--subset_percent', type=float, default=None,
+                    help="Fraction of training data to use (0-1).")
+parser.add_argument('--augmentation', type=str, default=None,
+                    help="Enable ('yes') or disable ('no') data augmentation.")
+parser.add_argument('--batch_size', type=int, default=None,
+                    help="Batch size for loaders.")
+parser.add_argument('--num_workers', type=int, default=None,
+                    help="Number of worker processes for DataLoader.")
+parser.add_argument('--num_epochs', type=int, default=None,
+                    help="Number of epochs to train.")
+parser.add_argument('--learning_rate', type=float, default=None,
+                    help="Base learning rate.")
+parser.add_argument('--momentum', type=float, default=None,
+                    help="Momentum value for SGD.")
+parser.add_argument('--weight_decay', type=float, default=None,
+                    help="Weight decay for optimizer.")
+parser.add_argument('--nesterov', type=str2bool, default=None,
+                    help="Use Nesterov momentum.")
+parser.add_argument('--lr_milestones', type=int, nargs='*', default=None,
+                    help="Space-separated learning rate milestone epochs.")
+parser.add_argument('--lr_gamma', type=float, default=None,
+                    help="Factor to decay learning rate at each milestone.")
+parser.add_argument('--densenet_drop_rate', type=float, default=None,
+                    help="Drop rate for DenseNet variants.")
+parser.add_argument('--densenet_compression', type=float, default=None,
+                    help="Compression rate for DenseNet variants.")
+parser.add_argument('--alpha', type=float, default=None,
+                    help="KD loss weight.")
+parser.add_argument('--temperature', type=float, default=None,
+                    help="KD temperature.")
+parser.add_argument('--use_kd', type=str2bool, default=None,
+                    help="Enable knowledge distillation training mode.")
+parser.add_argument('--label_smoothing', type=float, default=None,
+                    help="Label smoothing factor.")
+parser.add_argument('--save_best_only', type=str2bool, default=None,
+                    help="Store only best checkpoint.")
+parser.add_argument('--save_summary_steps', type=int, default=None,
+                    help="Steps between training log summaries.")
+
+
+CLI_PARAM_FIELDS = (
+    "dataset",
+    "arch",
+    "model_version",
+    "teacher",
+    "subset_percent",
+    "augmentation",
+    "batch_size",
+    "num_workers",
+    "num_epochs",
+    "learning_rate",
+    "momentum",
+    "weight_decay",
+    "nesterov",
+    "lr_milestones",
+    "lr_gamma",
+    "densenet_drop_rate",
+    "densenet_compression",
+    "alpha",
+    "temperature",
+    "use_kd",
+    "label_smoothing",
+    "save_best_only",
+    "save_summary_steps",
+)
+
+CLI_PARAM_DEFAULTS = {
+    "teacher": "none",
+    "subset_percent": 1.0,
+    "augmentation": "yes",
+    "batch_size": 128,
+    "num_workers": 4,
+    "learning_rate": 0.1,
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "nesterov": True,
+    "lr_milestones": [60, 120, 160],
+    "lr_gamma": 0.2,
+    "densenet_drop_rate": 0.0,
+    "densenet_compression": 2,
+    "alpha": 0.0,
+    "temperature": 1.0,
+    "use_kd": False,
+    "label_smoothing": 0.0,
+    "save_best_only": True,
+    "save_summary_steps": 100,
+}
+
+CLI_REQUIRED_FIELDS = ("dataset", "arch", "model_version", "num_epochs")
+
+
+def _normalize_lr_milestones(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    if isinstance(value, str):
+        parts = [p for p in value.replace(",", " ").split() if p]
+        return [int(p) for p in parts]
+    return [int(value)]
+
+
+def build_params_from_cli_args(args):
+    """Assemble a Params instance from CLI overrides when --config is omitted."""
+    data = {}
+    for field in CLI_PARAM_FIELDS:
+        value = getattr(args, field, None)
+        if value is None:
+            value = CLI_PARAM_DEFAULTS.get(field)
+        if field == "lr_milestones" and value is not None:
+            value = _normalize_lr_milestones(value)
+        if value is not None:
+            data[field] = value
+    missing = [field for field in CLI_REQUIRED_FIELDS if field not in data or data[field] is None]
+    if missing:
+        raise ValueError(
+            "Missing required hyperparameters when --config is not provided: {}".format(
+                ", ".join(missing)
+            )
+        )
+    return utils.Params.from_dict(data)
+
+
+def compose_epoch_snapshot(epoch_idx, train_metrics, val_metrics):
+    """Merge train/val metrics along with epoch metadata for serialization."""
+    snapshot = dict(val_metrics)
+    snapshot["epoch"] = epoch_idx
+    if train_metrics:
+        for key in ("train_loss", "train_ce_loss", "train_kd_loss", "train_grad_norm"):
+            if key in train_metrics:
+                snapshot[key] = train_metrics[key]
+    ce_val = snapshot.get("ce_loss", snapshot.get("loss"))
+    if ce_val is not None:
+        snapshot.setdefault("val_ce_loss", ce_val)
+    kd_val = snapshot.get("kd_loss")
+    if kd_val is None:
+        kd_val = 0.0
+    snapshot["val_kd_loss"] = kd_val
+    return snapshot
 
 
 def seed_everything(seed=42):
@@ -287,7 +434,8 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, optimizer,
 
         # Evaluate for one epoch on validation set
         val_metrics = evaluate(model, loss_fn, val_dataloader, metrics, params)
-        last_metrics_snapshot = dict(val_metrics)
+        snapshot = compose_epoch_snapshot(epoch + 1, train_metrics, val_metrics)
+        last_metrics_snapshot = snapshot
         completed_epoch = epoch + 1
 
         val_acc = val_metrics['accuracy']
@@ -319,16 +467,16 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, optimizer,
         if is_best:
             logging.info("- Found new best accuracy")
             best_val_acc = val_acc
-            best_metrics_snapshot = dict(val_metrics)
+            best_metrics_snapshot = dict(snapshot)
             best_epoch = epoch + 1
 
             # Save best val metrics in a json file in the model directory
             best_json_path = os.path.join(model_dir, "metrics_val_best_weights.json")
-            utils.save_dict_to_json(val_metrics, best_json_path)
+            utils.save_dict_to_json(best_metrics_snapshot, best_json_path)
 
         # Save latest val metrics in a json file in the model directory
         last_json_path = os.path.join(model_dir, "metrics_val_last_weights.json")
-        utils.save_dict_to_json(val_metrics, last_json_path)
+        utils.save_dict_to_json(snapshot, last_json_path)
 
         if board_logger and board_logger.enabled:
             train_payload = {"train/{}".format(k): v for k, v in train_metrics.items()}
@@ -484,8 +632,9 @@ def train_and_evaluate_kd(model, teacher_model, train_dataloader, val_dataloader
                                  metrics, params)
 
         # Evaluate for one epoch on validation set
-        val_metrics = evaluate_kd(model, val_dataloader, metrics, params)
-        last_metrics_snapshot = dict(val_metrics)
+        val_metrics = evaluate_kd(model, teacher_model, loss_fn_kd, val_dataloader, metrics, params)
+        snapshot = compose_epoch_snapshot(epoch + 1, train_metrics, val_metrics)
+        last_metrics_snapshot = snapshot
         completed_epoch = epoch + 1
 
         val_acc = val_metrics['accuracy']
@@ -517,16 +666,16 @@ def train_and_evaluate_kd(model, teacher_model, train_dataloader, val_dataloader
         if is_best:
             logging.info("- Found new best accuracy")
             best_val_acc = val_acc
-            best_metrics_snapshot = dict(val_metrics)
+            best_metrics_snapshot = dict(snapshot)
             best_epoch = epoch + 1
 
             # Save best val metrics in a json file in the model directory
             best_json_path = os.path.join(model_dir, "metrics_val_best_weights.json")
-            utils.save_dict_to_json(val_metrics, best_json_path)
+            utils.save_dict_to_json(best_metrics_snapshot, best_json_path)
 
         # Save latest val metrics in a json file in the model directory
         last_json_path = os.path.join(model_dir, "metrics_val_last_weights.json")
-        utils.save_dict_to_json(val_metrics, last_json_path)
+        utils.save_dict_to_json(snapshot, last_json_path)
 
         if board_logger and board_logger.enabled:
             train_payload = {"train/{}".format(k): v for k, v in train_metrics.items()}
@@ -569,16 +718,12 @@ if __name__ == '__main__':
     if args.config:
         json_path = args.config
         config_dir = os.path.dirname(json_path) or '.'
+        assert os.path.isfile(json_path), "No json configuration file found at {}".format(json_path)
+        params = utils.Params(json_path)
     else:
-        config_dir = args.model_dir
-        if os.path.isdir(config_dir):
-            json_path = os.path.join(config_dir, 'params.json')
-        else:
-            json_path = config_dir
-            config_dir = os.path.dirname(config_dir) or '.'
-
-    assert os.path.isfile(json_path), "No json configuration file found at {}".format(json_path)
-    params = utils.Params(json_path)
+        json_path = None
+        config_dir = args.model_dir or parser.get_default('model_dir') or '.'
+        params = build_params_from_cli_args(args)
 
     if args.teacher_checkpoint:
         params.teacher_checkpoint = args.teacher_checkpoint

@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import utils
 import model.net as net
 import model.resnet as resnet
@@ -80,7 +81,10 @@ def evaluate(model, loss_fn, dataloader, metrics, params):
             err1_pct = (1.0 - top1) * 100.0
             err5_pct = (1.0 - top5) * 100.0
 
-            summary_batch['loss'] = loss.item()
+            ce_loss_value = loss.item()
+            summary_batch['loss'] = ce_loss_value
+            summary_batch['ce_loss'] = ce_loss_value
+            summary_batch['kd_loss'] = 0.0
             summary_batch['test_acc1'] = top1_pct
             summary_batch['test_acc5'] = top5_pct
             summary_batch['test_err1'] = err1_pct
@@ -99,7 +103,7 @@ This function duplicates "evaluate()" but ignores "loss_fn" simply for speedup p
 Validation loss during KD mode would display '0' all the time.
 One can bring that info back by using the fetched teacher outputs during evaluation (refer to train.py)
 """
-def evaluate_kd(model, dataloader, metrics, params):
+def evaluate_kd(model, teacher_model, loss_fn_kd, dataloader, metrics, params):
     """Evaluate the model on `num_steps` batches.
 
     Args:
@@ -113,6 +117,8 @@ def evaluate_kd(model, dataloader, metrics, params):
 
     # set model to evaluation mode
     model.eval()
+    teacher_model.eval()
+    alpha = getattr(params, 'alpha', 0.0)
 
     # summary for current eval loop
     summ = []
@@ -129,8 +135,10 @@ def evaluate_kd(model, dataloader, metrics, params):
             # compute model output
             output_batch = model(data_batch)
 
-            # loss = loss_fn_kd(output_batch, labels_batch, output_teacher_batch, params)
-            loss = 0.0  # force validation loss to zero to reduce computation time
+            teacher_batch = teacher_model(data_batch)
+            kd_total = loss_fn_kd(output_batch, labels_batch, teacher_batch, params)
+            ce_loss = F.cross_entropy(output_batch, labels_batch)
+            kd_component = kd_total - ce_loss * (1.0 - alpha)
 
             top1, top5 = compute_topk_metrics(output_batch, labels_batch, topk=(1, 5))
 
@@ -148,7 +156,9 @@ def evaluate_kd(model, dataloader, metrics, params):
             err1_pct = (1.0 - top1) * 100.0
             err5_pct = (1.0 - top5) * 100.0
 
-            summary_batch['loss'] = loss
+            summary_batch['loss'] = kd_total.item()
+            summary_batch['ce_loss'] = ce_loss.item()
+            summary_batch['kd_loss'] = kd_component.detach().item() if torch.is_tensor(kd_component) else float(kd_component)
             summary_batch['test_acc1'] = top1_pct
             summary_batch['test_acc5'] = top5_pct
             summary_batch['test_err1'] = err1_pct

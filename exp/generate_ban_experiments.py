@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
+import shlex
 from pathlib import Path
 from textwrap import dedent
 
@@ -29,6 +29,32 @@ BASE_TRAINING_PARAMS = {
 DEFAULT_LR_MILESTONE_RATIOS = (0.3, 0.6, 0.8)
 DEFAULT_WANDB_PROJECT = "BAN"
 GENERATION_ORDER = ("vanilla", "gen1", "gen2", "gen3")
+DEFAULT_STAGE_SEED_OFFSET = 101
+CONFIG_ARG_ORDER = [
+    "dataset",
+    "arch",
+    "model_version",
+    "teacher",
+    "subset_percent",
+    "augmentation",
+    "batch_size",
+    "num_workers",
+    "num_epochs",
+    "learning_rate",
+    "momentum",
+    "weight_decay",
+    "nesterov",
+    "lr_milestones",
+    "lr_gamma",
+    "densenet_drop_rate",
+    "densenet_compression",
+    "alpha",
+    "temperature",
+    "use_kd",
+    "label_smoothing",
+    "save_best_only",
+    "save_summary_steps",
+]
 
 MODEL_SPECS = {
     "densenet80_80_cifar100": {
@@ -62,14 +88,14 @@ EXPERIMENT_RECIPES = {
         "num_epochs": 200,
         "lr_milestone_ratios": DEFAULT_LR_MILESTONE_RATIOS,
         "training_overrides": {},
-        "model_root_strategy": "legacy",
+        "model_root_strategy": "grouped",
         "wandb_project": DEFAULT_WANDB_PROJECT,
     },
     "ban-e300": {
         "num_epochs": 300,
         "lr_milestone_ratios": DEFAULT_LR_MILESTONE_RATIOS,
         "training_overrides": {},
-        "model_root_strategy": "scoped",
+        "model_root_strategy": "grouped",
         "wandb_project": DEFAULT_WANDB_PROJECT,
     },
 }
@@ -108,6 +134,7 @@ def prepare_recipe(raw_recipe: dict) -> dict:
     kd_temperature = recipe.pop("kd_temperature", 1.0)
 
     training_overrides = dict(recipe.pop("training_overrides", {}))
+    stage_seed_overrides = dict(recipe.pop("stage_seeds", {}))
 
     # Allow any BASE_TRAINING_PARAMS specified directly in the recipe to override defaults.
     for key in list(recipe.keys()):
@@ -128,6 +155,13 @@ def prepare_recipe(raw_recipe: dict) -> dict:
     config_defaults["num_epochs"] = num_epochs
     config_defaults["lr_milestones"] = lr_milestones
 
+    base_seed = config_defaults.get("seed", BASE_TRAINING_PARAMS.get("seed", 1337))
+    stage_seeds = {}
+    for idx, stage in enumerate(GENERATION_ORDER):
+        stage_seeds[stage] = stage_seed_overrides.get(
+            stage, base_seed + idx * DEFAULT_STAGE_SEED_OFFSET
+        )
+
     prepared = dict(recipe)
     prepared.update({
         "lr_milestone_ratios": lr_milestone_ratios,
@@ -138,16 +172,26 @@ def prepare_recipe(raw_recipe: dict) -> dict:
         "model_root_strategy": model_root_strategy,
         "kd_alpha": kd_alpha,
         "kd_temperature": kd_temperature,
+        "stage_seeds": stage_seeds,
     })
     return prepared
 
 
-def resolve_model_stage_dir(
-    models_root: Path, exp_name: str, stage_slug: str, strategy: str
+def resolve_model_run_dir(
+    models_root: Path,
+    strategy: str,
+    exp_name: str,
+    arch_tag: str,
+    stage_slug: str,
+    run_name: str,
 ) -> Path:
     if strategy == "legacy":
-        return models_root / stage_slug
-    return models_root / exp_name / stage_slug
+        return models_root / stage_slug / run_name
+    if strategy == "scoped":
+        return models_root / exp_name / stage_slug / run_name
+    if strategy == "grouped":
+        return models_root / exp_name / arch_tag / stage_slug
+    raise ValueError(f"Unsupported model_root_strategy '{strategy}'.")
 
 
 def derive_arch_tag(arch_name: str, dataset: str) -> str:
@@ -155,6 +199,38 @@ def derive_arch_tag(arch_name: str, dataset: str) -> str:
     if arch_name.endswith(suffix):
         return arch_name[: -len(suffix)]
     return arch_name
+
+
+def _format_cli_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def build_cli_options(config: dict) -> list[tuple[str, list[str]]]:
+    options: list[tuple[str, list[str]]] = []
+    handled = set()
+    for key in CONFIG_ARG_ORDER:
+        if key not in config:
+            continue
+        handled.add(key)
+        value = config[key]
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            values = [_format_cli_value(v) for v in value]
+        else:
+            values = [_format_cli_value(value)]
+        options.append((f"--{key}", values))
+    for key, value in config.items():
+        if key in handled or value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            values = [_format_cli_value(v) for v in value]
+        else:
+            values = [_format_cli_value(value)]
+        options.append((f"--{key}", values))
+    return options
 
 
 def build_stage_config(
@@ -193,21 +269,18 @@ def build_stage_contexts(
     recipe: dict,
     model_name: str,
     model_spec: dict,
-    config_base: Path,
     models_root: Path,
 ) -> list[dict]:
     contexts: list[dict] = []
     prev_context: dict | None = None
     arch_tag = derive_arch_tag(model_name, model_spec["dataset"])
+    strategy = recipe["model_root_strategy"]
     for stage_slug in GENERATION_ORDER:
         arch_config_name = f"{stage_slug}_{model_name}"
         run_name = f"{exp_name}_{stage_slug}_{model_name}"
-        config_dir = config_base / arch_config_name
-        config_path = config_dir / f"{arch_config_name}.json"
-        model_stage_dir = resolve_model_stage_dir(
-            models_root, exp_name, stage_slug, recipe["model_root_strategy"]
+        model_run_dir = resolve_model_run_dir(
+            models_root, strategy, exp_name, arch_tag, stage_slug, run_name
         )
-        model_run_dir = model_stage_dir / run_name
         best_checkpoint = model_run_dir / "best.pth.tar"
         teacher_ckpt = prev_context["best_checkpoint"] if prev_context else None
         if stage_slug != "vanilla" and teacher_ckpt is None:
@@ -218,6 +291,10 @@ def build_stage_contexts(
         config_payload = build_stage_config(
             model_spec, recipe, stage_slug, arch_config_name
         )
+        training_seed = recipe["stage_seeds"].get(
+            stage_slug, config_payload.get("seed", BASE_TRAINING_PARAMS.get("seed", 42))
+        )
+        config_payload.pop("seed", None)
         wandb_tags = [
             exp_name,
             stage_slug,
@@ -227,6 +304,7 @@ def build_stage_contexts(
         ]
         if stage_slug != "vanilla":
             wandb_tags.append("kd")
+        cli_options = build_cli_options(config_payload)
         context = {
             "stage_slug": stage_slug,
             "arch_name": model_name,
@@ -234,26 +312,16 @@ def build_stage_contexts(
             "arch_tag": arch_tag,
             "dataset": model_spec["dataset"],
             "run_name": run_name,
-            "config_path": config_path,
-            "config": config_payload,
-            "model_stage_dir": model_stage_dir,
             "model_run_dir": model_run_dir,
             "best_checkpoint": best_checkpoint,
             "teacher_checkpoint": teacher_ckpt,
+            "cli_options": cli_options,
+            "train_seed": training_seed,
             "wandb_tags": wandb_tags,
         }
         contexts.append(context)
         prev_context = context
     return contexts
-
-
-def write_json(path: Path, payload: dict, dry_run: bool) -> None:
-    if dry_run:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=4)
-        handle.write("\n")
 
 
 def write_script(path: Path, content: str, dry_run: bool) -> None:
@@ -265,33 +333,46 @@ def write_script(path: Path, content: str, dry_run: bool) -> None:
 
 
 def render_stage_block(ctx: dict, wandb_project: str) -> str:
-    tags = " ".join(ctx["wandb_tags"])
-    teacher_cli = ""
+    tags_joined = " ".join(shlex.quote(tag) for tag in ctx["wandb_tags"])
+    cli_options = list(ctx["cli_options"])
     if ctx["teacher_checkpoint"] is not None:
-        teacher_cli = (
-            f'  --teacher_checkpoint "{ctx["teacher_checkpoint"].as_posix()}" \\\n'
+        cli_options.append(
+            (
+                "--teacher_checkpoint",
+                [ctx["teacher_checkpoint"].as_posix()],
+            )
         )
+
+    command_lines = [
+        "srun python -u train.py \\",
+        f'  --model_dir="{ctx["model_run_dir"].as_posix()}" \\',
+        "  --enable_wandb true \\",
+        "  --wandb_mode online \\",
+        f"  --project {wandb_project} \\",
+        '  --experiment "${RUN_NAME}" \\',
+        f"  --seed {ctx['train_seed']} \\",
+        f"  --wandb_tags {tags_joined}",
+    ]
+
+    if cli_options:
+        command_lines[-1] = command_lines[-1] + " \\"
+        for flag, values in cli_options:
+            value_str = " ".join(shlex.quote(v) for v in values)
+            command_lines.append(f"  {flag} {value_str} \\")
+        command_lines[-1] = command_lines[-1].rstrip(" \\")
+
+    command_block = "\n".join(command_lines)
+
     block = f"""
 echo ""
 echo ">>> [{ctx['stage_slug'].upper()}] {ctx['arch_name']} ({ctx['dataset']})"
 RUN_NAME="{ctx['run_name']}"
-CONFIG_PATH="{ctx['config_path'].as_posix()}"
-MODEL_STAGE_DIR="{ctx['model_stage_dir'].as_posix()}"
 MODEL_DIR="{ctx['model_run_dir'].as_posix()}"
-mkdir -p "{ctx['model_stage_dir'].as_posix()}"
 mkdir -p "{ctx['model_run_dir'].as_posix()}"
 
 export WANDB_RUN_NAME="${{RUN_NAME}}"
 
-srun python -u train.py \\
-  --model_dir="{ctx['model_run_dir'].as_posix()}" \\
-  --config="{ctx['config_path'].as_posix()}" \\
-  --enable_wandb true \\
-  --wandb_mode online \\
-  --project {wandb_project} \\
-  --experiment "${{RUN_NAME}}" \\
-{teacher_cli}  --seed 42 \\
-  --wandb_tags {tags}
+{command_block}
 """
     return dedent(block).strip()
 
@@ -316,8 +397,8 @@ def render_run_script(
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=50G
-#SBATCH --gres=gpu:4
-#SBATCH --time=48:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --time=72:00:00
 #SBATCH --output={output_path}
 
 set -euo pipefail
@@ -366,26 +447,20 @@ def generate_experiment(
     recipe: dict,
     arch_names: list[str],
     repo_root: Path,
-    config_root: Path,
     run_root: Path,
     models_root: Path,
     dry_run: bool,
-) -> tuple[int, int]:
-    config_base = config_root / exp_name
+) -> int:
     run_dir = run_root / exp_name
     run_out_dir = run_dir / "out"
     if not dry_run:
         run_out_dir.mkdir(parents=True, exist_ok=True)
-    config_count = 0
     run_scripts: list[Path] = []
     for arch_name in arch_names:
         model_spec = MODEL_SPECS[arch_name]
         stage_contexts = build_stage_contexts(
-            exp_name, recipe, arch_name, model_spec, config_base, models_root
+            exp_name, recipe, arch_name, model_spec, models_root
         )
-        for ctx in stage_contexts:
-            write_json(ctx["config_path"], ctx["config"], dry_run)
-            config_count += 1
         run_script_path = run_dir / f"train_{arch_name}.sh"
         script_body = render_run_script(
             exp_name, arch_name, recipe, stage_contexts, repo_root, run_out_dir
@@ -395,7 +470,7 @@ def generate_experiment(
     run_all_path = run_dir / "run_all.sh"
     run_all_body = render_run_all(run_scripts)
     write_script(run_all_path, run_all_body, dry_run)
-    return config_count, len(run_scripts) + 1  # include run_all
+    return len(run_scripts) + 1  # include run_all
 
 
 def main() -> None:
@@ -403,7 +478,6 @@ def main() -> None:
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
     repo_root = project_root / "knowledge-distillation-pytorch"
-    config_root = repo_root / "experiments"
     run_root = project_root / "exp"
     models_root = project_root / "models"
 
@@ -420,20 +494,17 @@ def main() -> None:
 
     for exp_name in exp_names:
         recipe = prepare_recipe(EXPERIMENT_RECIPES[exp_name])
-        config_count, script_count = generate_experiment(
+        script_count = generate_experiment(
             exp_name,
             recipe,
             arch_names,
             repo_root,
-            config_root,
             run_root,
             models_root,
             args.dry_run,
         )
         mode = "DRY" if args.dry_run else "WROTE"
-        print(
-            f"[{mode}] {exp_name}: {config_count} configs, {script_count} scripts (train + run_all)."
-        )
+        print(f"[{mode}] {exp_name}: {script_count} scripts (train + run_all).")
 
 
 if __name__ == "__main__":

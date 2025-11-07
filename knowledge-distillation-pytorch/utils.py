@@ -25,6 +25,13 @@ class Params():
             params = json.load(f)
             self.__dict__.update(params)
 
+    @classmethod
+    def from_dict(cls, data):
+        """Create a Params instance directly from an in-memory dictionary."""
+        instance = cls.__new__(cls)
+        instance.__dict__ = dict(data) if data is not None else {}
+        return instance
+
     def save(self, json_path):
         with open(json_path, 'w') as f:
             json.dump(self.__dict__, f, indent=4)
@@ -93,17 +100,22 @@ def set_logger(log_path):
         logger.addHandler(stream_handler)
 
 
-def save_dict_to_json(d, json_path):
-    """Saves dict of floats in json file
+def _to_serializable(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        return value.item() if value.numel() == 1 else value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
 
-    Args:
-        d: (dict) of float-castable values (np.float, int, float, etc.)
-        json_path: (string) path to json file
-    """
+
+def save_dict_to_json(d, json_path):
+    """Saves dict values in json file, coercing tensors/numpy scalars to native types."""
+    serializable = {k: _to_serializable(v) for k, v in d.items()}
     with open(json_path, 'w') as f:
-        # We need to convert the values to float for json (it doesn't accept np.array, np.float, )
-        d = {k: float(v) for k, v in d.items()}
-        json.dump(d, f, indent=4)
+        json.dump(serializable, f, indent=4)
 
 
 def save_checkpoint(state, is_best, checkpoint):
