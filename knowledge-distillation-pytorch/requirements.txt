@@ -1,0 +1,8 @@
+numpy>=1.23
+scipy>=1.10
+Pillow>=9.5
+tabulate>=0.9
+torch>=2.1
+torchvision>=0.16
+tqdm>=4.66
+wandb>=0.16
